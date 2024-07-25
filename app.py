@@ -9,7 +9,7 @@ from PyPDF2 import PdfReader  # Import PyPDF2 for PDF parsing
 
 # We will be using Titan Embeddings Model to generate Embedding
 from langchain_community.embeddings import BedrockEmbeddings
-from langchain_community.llms import Bedrock
+from langchain_aws import BedrockLLM  # Use the updated import
 
 # Data Ingestion
 import numpy as np
@@ -29,15 +29,14 @@ bedrock = boto3.client(service_name="bedrock-runtime", region_name=region_name)
 # Initialize AWS clients for transcription and connect
 transcribe = boto3.client('transcribe', region_name=region_name)
 connect = boto3.client('connect', region_name=region_name)
-dynamodb = boto3.resource('dynamodb', region_name=region_name)
-prompts_table = dynamodb.Table('InterviewPrompts')
 
 # Data ingestion
 def parse_resume(file):
     if file.name.endswith('.pdf'):
-        loader = PyPDFDirectoryLoader(path=os.path.dirname(file.name))
-        documents = loader.load()
-        text = documents[0].content
+        reader = PdfReader(file)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
     elif file.name.endswith('.docx'):
         doc = docx.Document(file)
         text = "\n".join([para.text for para in doc.paragraphs])
@@ -59,68 +58,79 @@ def get_vector_store(embeddings):
 
 def get_llama3_llm():
     # Create the Llama 3 Model
-    return Bedrock(model_id="meta.llama3-70b-instruct-v1:0", client=bedrock, model_kwargs={'max_gen_len':512})
+    return BedrockLLM(model_id="meta.llama3-70b-instruct-v1:0", client=bedrock, model_kwargs={'max_gen_len':128})
+
+def truncate_text(text, max_tokens=500):
+    """Truncate text to ensure it doesn't exceed the token limit."""
+    words = text.split()
+    if len(words) > max_tokens:
+        return ' '.join(words[:max_tokens]) + '...'
+    return text
+
+def clean_standard_questions(questions):
+    cleaned_questions = []
+    for question in questions:
+        cleaned_question = ' '.join(question.split())  # Remove extra spaces and newlines
+        cleaned_questions.append(cleaned_question)
+    return cleaned_questions
 
 # Prompt template to generate new questions
 def create_prompt(context, standard_questions, transcript):
+    truncated_context = truncate_text(context)
+    cleaned_questions = clean_standard_questions(standard_questions)
+    truncated_standard_questions = truncate_text(' '.join(cleaned_questions), max_tokens=200)
+    truncated_transcript = truncate_text(transcript, max_tokens=200)
+    
     return f"""
-    Based on the following resume content, standard interview questions, and the interviewee's recent response, generate a new follow-up interview question tailored to the interviewee.
+    Based on the following resume content, standard interview questions, and the interviewee's recent response, generate a concise follow-up interview question (1 or 2 sentences) tailored to the interviewee.
 
     Resume Content:
-    {context}
+    {truncated_context}
 
     Standard Interview Questions:
-    {standard_questions}
+    {truncated_standard_questions}
 
     Interviewee's Response:
-    {transcript}
+    {truncated_transcript}
 
     New Follow-Up Question:
     """
 
 def generate_question(llm, context, standard_questions, transcript):
     prompt = create_prompt(context, standard_questions, transcript)
-    response = llm.generate(prompt)
-    return response['generated_text']
+    try:
+        response = llm.invoke(prompt)
+        return response.strip()  # Assuming the response is plain text
+    except Exception as e:
+        st.error(f"Error generating question: {e}")
+        return "An error occurred while generating the question."
 
 def start_transcription_streaming(resume_text, standard_questions):
     import asyncio
-    from transcribe_streaming import TranscribeStreamingClient  # Assuming you have the AWS Transcribe Streaming SDK
-    
+    from websockets import connect
+
     async def transcribe_streaming():
-        transcribe_client = TranscribeStreamingClient()
-        stream = await transcribe_client.start_stream_transcription(
-            language_code="en-US",
-            media_sample_rate_hz=16000,
-            media_encoding="pcm"
-        )
-        
-        async def write_chunks():
-            with open("audio.wav", "rb") as f:
-                while chunk := f.read(4096):
-                    await stream.input_stream.send_audio_event(audio_chunk=chunk)
-            await stream.input_stream.end_stream()
-        
-        async def read_chunks():
-            async for event in stream.output_stream:
-                if isinstance(event, TranscriptResultStream.TranscriptEvent):
-                    transcript = event.transcript.results[0].alternatives[0].transcript
-                    st.write("Interviewee Response: ", transcript)
-                    llm = get_llama3_llm()
-                    new_question = generate_question(llm, resume_text, standard_questions, transcript)
-                    st.write("Generated Follow-Up Question: ", new_question)
+        async with connect(
+            f"wss://transcribestreaming.{region_name}.amazonaws.com:8443/stream-transcription-websocket?media-encoding=pcm&sample-rate=16000"
+        ) as ws:
+            async def send_audio():
+                with open("audio.wav", "rb") as f:
+                    while chunk := f.read(4096):
+                        await ws.send(chunk)
+                await ws.send(json.dumps({'event': 'AudioEvent', 'AudioData': None}))  # Send the end signal
 
-        await asyncio.gather(write_chunks(), read_chunks())
-    
+            async def receive_transcript():
+                async for message in ws:
+                    event = json.loads(message)
+                    if 'Transcript' in event:
+                        transcript = event['Transcript']['Results'][0]['Alternatives'][0]['Transcript']
+                        llm = get_llama3_llm()
+                        new_question = generate_question(llm, resume_text, standard_questions, transcript)
+                        st.write("Generated Follow-Up Question: ", new_question)
+
+            await asyncio.gather(send_audio(), receive_transcript())
+
     asyncio.run(transcribe_streaming())
-
-def store_standard_questions(prompts):
-    for prompt in prompts:
-        prompts_table.put_item(Item={'prompt_id': str(uuid.uuid4()), 'prompt': prompt})
-
-def get_standard_questions():
-    response = prompts_table.scan()
-    return [item['prompt'] for item in response['Items']]
 
 def parse_prompts_from_file(file):
     if file.name.endswith('.pdf'):
@@ -147,6 +157,10 @@ def start_session(phone_number):
     )
     return response
 
+# Initialize session state for standard questions
+if "standard_questions" not in st.session_state:
+    st.session_state.standard_questions = []
+
 # Streamlit UI
 st.title("Interview Assistant App")
 
@@ -171,21 +185,15 @@ prompt_file = st.file_uploader("Choose a PDF or DOCX file with standard prompts"
 
 if prompt_file is not None:
     prompts = parse_prompts_from_file(prompt_file)
-    store_standard_questions(prompts)
+    st.session_state.standard_questions = prompts
     st.success("Prompts imported successfully.")
-
-# Get standard prompts
-st.header("Get Standard Prompts")
-if st.button("Get Prompts"):
-    standard_questions = get_standard_questions()
-    st.write(standard_questions)
 
 # Generate interview questions
 st.header("Generate Interview Questions")
 if st.button("Generate Questions"):
-    if uploaded_file and standard_questions:
+    if uploaded_file and len(st.session_state.standard_questions) > 0:
         llm = get_llama3_llm()
-        initial_question = generate_question(llm, resume_text, standard_questions, "")
+        initial_question = generate_question(llm, resume_text, st.session_state.standard_questions, "")
         st.write("Initial Question: ", initial_question)
     else:
         st.warning("Please upload a resume and import standard interview questions first.")
@@ -193,8 +201,8 @@ if st.button("Generate Questions"):
 # Real-time transcription
 st.header("Real-time Transcription")
 if st.button("Start Real-time Transcription"):
-    if resume_vector and standard_questions:
-        start_transcription_streaming(resume_text, standard_questions)
+    if resume_vector is not None and resume_vector.any() and len(st.session_state.standard_questions) > 0:
+        start_transcription_streaming(resume_text, st.session_state.standard_questions)
         st.success("Real-time transcription started.")
     else:
         st.warning("Please upload a resume and import standard interview questions first.")

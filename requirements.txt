@@ -2,8 +2,10 @@ streamlit
 boto3
 numpy
 faiss-cpu
-docx
+python-docx
 PyPDF2
 langchain_community
 langchain
+langchain-aws
 awscli
+websockets
