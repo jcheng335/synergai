@@ -51,9 +51,10 @@ def parse_resume(file):
     return chunks
 
 def get_vector_store(docs):
-    vectorstore_faiss = FAISS.from_documents(docs, bedrock_embeddings)
-    vectorstore_faiss.save_local("faiss_index")
-    return vectorstore_faiss
+    vectors = [bedrock_embeddings.embed(doc) for doc in docs]
+    index = faiss.IndexFlatL2(len(vectors[0]))
+    index.add(np.array(vectors).astype('float32'))
+    return index
 
 def get_llama3_llm():
     # Create the Llama 3 Model
@@ -113,6 +114,14 @@ def start_transcription_streaming(resume_text, standard_questions):
     
     asyncio.run(transcribe_streaming())
 
+def store_standard_questions(prompts):
+    for prompt in prompts:
+        prompts_table.put_item(Item={'prompt': prompt})
+
+def get_standard_questions():
+    response = prompts_table.scan()
+    return [item['prompt'] for item in response['Items']]
+
 def start_session(phone_number):
     instance_id = os.environ.get('CONNECT_INSTANCE_ID', 'your_instance_id')
     contact_flow_id = os.environ.get('CONNECT_CONTACT_FLOW_ID', 'your_contact_flow_id')
@@ -148,15 +157,13 @@ st.header("Import Standard Prompts")
 prompts = st.text_area("Enter standard prompts (one per line)")
 if st.button("Import Prompts"):
     prompts_list = prompts.split("\n")
-    for prompt in prompts_list:
-        prompts_table.put_item(Item={'prompt': prompt})
+    store_standard_questions(prompts_list)
     st.success("Prompts imported successfully.")
 
 # Get standard prompts
 st.header("Get Standard Prompts")
 if st.button("Get Prompts"):
-    response = prompts_table.scan()
-    standard_questions = [item['prompt'] for item in response['Items']]
+    standard_questions = get_standard_questions()
     st.write(standard_questions)
 
 # Generate interview questions
