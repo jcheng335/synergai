@@ -3,6 +3,9 @@ import os
 import sys
 import boto3
 import streamlit as st
+import docx
+import uuid
+from PyPDF2 import PdfReader  # Import PyPDF2 for PDF parsing
 
 # We will be using Titan Embeddings Model to generate Embedding
 from langchain_community.embeddings import BedrockEmbeddings
@@ -17,16 +20,11 @@ from langchain_community.document_loaders import PyPDFDirectoryLoader
 import faiss
 from langchain_community.vectorstores import FAISS
 
-# LLM Models
-from langchain.prompts import PromptTemplate
-from langchain.chains import RetrievalQA
-
 # Set the region
 region_name = "us-east-1"
 
 # Bedrock Clients
 bedrock = boto3.client(service_name="bedrock-runtime", region_name=region_name)
-bedrock_embeddings = BedrockEmbeddings(model_id="amazon.titan-embed-text-v1", client=bedrock)
 
 # Initialize AWS clients for transcription and connect
 transcribe = boto3.client('transcribe', region_name=region_name)
@@ -50,16 +48,18 @@ def parse_resume(file):
     chunks = splitter.split_text(text)
     return chunks
 
-def get_vector_store(docs):
-    vectors = [bedrock_embeddings.embed(doc) for doc in docs]
-    index = faiss.IndexFlatL2(len(vectors[0]))
-    index.add(np.array(vectors).astype('float32'))
+def embed_documents(docs):
+    bedrock_embeddings = BedrockEmbeddings(model_id="amazon.titan-embed-text-v1", client=bedrock)
+    return [bedrock_embeddings.embed_query(doc) for doc in docs]
+
+def get_vector_store(embeddings):
+    index = faiss.IndexFlatL2(len(embeddings[0]))
+    index.add(np.array(embeddings).astype('float32'))
     return index
 
 def get_llama3_llm():
     # Create the Llama 3 Model
-    llm = Bedrock(model_id="meta.llama3-70b-instruct-v1:0", client=bedrock, model_kwargs={'max_gen_len':512})
-    return llm
+    return Bedrock(model_id="meta.llama3-70b-instruct-v1:0", client=bedrock, model_kwargs={'max_gen_len':512})
 
 # Prompt template to generate new questions
 def create_prompt(context, standard_questions, transcript):
@@ -80,8 +80,8 @@ def create_prompt(context, standard_questions, transcript):
 
 def generate_question(llm, context, standard_questions, transcript):
     prompt = create_prompt(context, standard_questions, transcript)
-    response = llm({"text": prompt})
-    return response['choices'][0]['text']
+    response = llm.generate(prompt)
+    return response['generated_text']
 
 def start_transcription_streaming(resume_text, standard_questions):
     import asyncio
@@ -116,11 +116,25 @@ def start_transcription_streaming(resume_text, standard_questions):
 
 def store_standard_questions(prompts):
     for prompt in prompts:
-        prompts_table.put_item(Item={'prompt': prompt})
+        prompts_table.put_item(Item={'prompt_id': str(uuid.uuid4()), 'prompt': prompt})
 
 def get_standard_questions():
     response = prompts_table.scan()
     return [item['prompt'] for item in response['Items']]
+
+def parse_prompts_from_file(file):
+    if file.name.endswith('.pdf'):
+        reader = PdfReader(file)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        prompts = text.strip().split('\n')
+    elif file.name.endswith('.docx'):
+        doc = docx.Document(file)
+        prompts = [para.text for para in doc.paragraphs]
+    else:
+        raise ValueError('Unsupported file format')
+    return prompts
 
 def start_session(phone_number):
     instance_id = os.environ.get('CONNECT_INSTANCE_ID', 'your_instance_id')
@@ -145,19 +159,19 @@ resume_text = None
 
 if uploaded_file is not None:
     resume_chunks = parse_resume(uploaded_file)
-    resume_vectors = [bedrock_embeddings.embed(chunk) for chunk in resume_chunks]
-    resume_vector = np.mean(resume_vectors, axis=0)
-    faiss_index = faiss.IndexFlatL2(resume_vector.shape[0])
-    faiss_index.add(np.array(resume_vectors).astype('float32'))
+    resume_embeddings = embed_documents(resume_chunks)
+    resume_vector = np.mean(resume_embeddings, axis=0)
+    faiss_index = get_vector_store(resume_embeddings)
     resume_text = "\n".join(resume_chunks)
     st.success("Resume parsed and stored successfully.")
 
 # Import standard prompts
 st.header("Import Standard Prompts")
-prompts = st.text_area("Enter standard prompts (one per line)")
-if st.button("Import Prompts"):
-    prompts_list = prompts.split("\n")
-    store_standard_questions(prompts_list)
+prompt_file = st.file_uploader("Choose a PDF or DOCX file with standard prompts", type=["pdf", "docx"])
+
+if prompt_file is not None:
+    prompts = parse_prompts_from_file(prompt_file)
+    store_standard_questions(prompts)
     st.success("Prompts imported successfully.")
 
 # Get standard prompts
@@ -196,4 +210,4 @@ if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == 'run':
         st.run()
     else:
-        st.warning("Run the script with 'python app.py run' to start the Streamlit server.")
+        st.warning("Run the script with 'streamlit run app.py' to start the Streamlit server.")
